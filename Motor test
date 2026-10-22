@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Left stick (up/down) -> throttle percent -> Arduino over USB serial.
+Stick up = +100, neutral = 0, stick down = -100 (the Arduino ignores negatives
+if BIDIRECTIONAL is false). Run:  python3 xbox_throttle.py [/dev/ttyACM0]
+Add --list to print the raw axis values so you can check the axis number.
+Needs:  pip install pygame pyserial
+"""
+import os, sys, time
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")   # no display on the Pi
+import pygame, serial
+
+PORT = next((a for a in sys.argv[1:] if a.startswith("/dev/")), "/dev/ttyACM0")
+AXIS_LEFT_Y = 1        # left stick vertical; pushed up reads about -1.0
+DEADZONE = 0.10        # ignore small drift around neutral
+SEND_HZ = 20
+
+pygame.init(); pygame.joystick.init()
+if pygame.joystick.get_count() == 0:
+    sys.exit("No controller found. Connect the Xbox controller to the Pi first.")
+js = pygame.joystick.Joystick(0); js.init()
+print("Controller:", js.get_name())
+
+if "--list" in sys.argv:
+    while True:
+        pygame.event.pump()
+        print("  ".join(f"a{i}={js.get_axis(i):+.2f}" for i in range(js.get_numaxes())), end="\r")
+        time.sleep(0.1)
+
+ser = serial.Serial(PORT, 115200, timeout=0.05)
+time.sleep(3.5)        # board resets when the port opens; wait out its arming delay
+print("Sending throttle. Ctrl+C to stop.")
+
+def throttle_percent():
+    pygame.event.pump()
+    v = -js.get_axis(AXIS_LEFT_Y)          # flip so up is positive
+    if abs(v) < DEADZONE:
+        return 0
+    v = (abs(v) - DEADZONE) / (1 - DEADZONE) * (1 if v > 0 else -1)   # rescale to 0..1
+    return int(round(max(-1.0, min(1.0, v)) * 100))
+
+try:
+    while True:
+        pct = throttle_percent()
+        ser.write(f"THR:{pct}\n".encode())
+        print(f"throttle {pct:+4d}%   {ser.readline().decode(errors='ignore').strip()}   ", end="\r")
+        time.sleep(1 / SEND_HZ)
+except KeyboardInterrupt:
+    pass
+finally:
+    ser.write(b"THR:0\n"); ser.close(); print("\nStopped.")

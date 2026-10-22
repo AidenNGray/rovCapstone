@@ -194,7 +194,7 @@ class Xbox:
             return 0
         self.pg.event.pump()
         v = -self.js.get_axis(self.AXIS_LEFT_Y)                      # flip so up is positive
-        if abs(v) < self.DEADZONE:
+        if v < self.DEADZONE:                                        # forward only: stick down or neutral = 0
             return 0
         v = (abs(v) - self.DEADZONE) / (1 - self.DEADZONE) * (1 if v > 0 else -1)
         return int(round(max(-1.0, min(1.0, v)) * 100))
@@ -284,8 +284,9 @@ def draw(stdscr, state, port_name, xbox):
 
     ctl = "controller: %s" % xbox.name if xbox.available() else "controller: NONE (%s)" % xbox.name
     stdscr.addstr(3, 0, ctl[: w - 1], curses.A_DIM)
-    mtxt = "MOTOR %s   stick: %+4d%%   ROV applying: %s%%" % (
-        "ENABLED " if enabled else "disabled", thr, applied if applied is not None else "--")
+    bar = "#" * (thr // 10) + "-" * (10 - thr // 10)
+    mtxt = "MOTOR %s  stick [%s] %3d%%   ROV applying: %s%%" % (
+        "ENABLED " if enabled else "disabled", bar, thr, applied if applied is not None else "--")
     stdscr.addstr(7, 0, mtxt[: w - 1], bold if enabled else curses.A_DIM)
 
     stdscr.addstr(8, 0, "SENT TO ROV (keyboard -> tether):", bold)

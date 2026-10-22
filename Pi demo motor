@@ -14,15 +14,18 @@ pyserial is used if present, otherwise a built-in fallback takes over):
 
 Keys:  arrow keys = send a command     p = ping the ROV     q = quit
        m = enable / disable the motor (starts DISABLED)
-Motor: left stick on the Xbox controller (up = max speed, neutral = 0). Needs pygame
+       l = set the speed limit: press l, type a number 0-100, press Enter (Esc cancels)
+Motor: left stick on the Xbox controller (up = forward, down = reverse, neutral = 0). Needs pygame
        (pip install pygame); without it, or with no controller, the keyboard demo still works.
 
 Wire protocol (plain text, one message per line, 115200 baud):
     Pi  -> ROV :  CMD:U | CMD:D | CMD:L | CMD:R      PING
-                  THR:<-100..100>                    (motor throttle %, sent ~20 times a second)
+                  THR:<-100..100>                    (motor throttle %, + forward / - reverse, ~20 times a second)
+                  MAX:<0..100>                       (speed limit %, set with the l key)
     ROV -> Pi  :  ACK:<letter>                       PONG
                   SENSOR:<id>:<distance_cm>          (sent by the Arduino every 0.5 s)
                   MOTOR:<percent>                    (throttle the Arduino is applying, every 0.5 s)
+                  LIMIT:<percent>                    (speed limit the Arduino is using, every 0.5 s)
 """
 import argparse
 import collections
@@ -52,6 +55,7 @@ class FakeRov:
         self._lock = threading.Lock()
         self._last_sensor = time.time()
         self._thr = 0
+        self._max = 25
         self.is_open = True
 
     def write(self, data):
@@ -60,11 +64,15 @@ class FakeRov:
                 self._push("ACK:" + raw[4:5])
             elif raw == "PING":
                 self._push("PONG")
-            elif raw.startswith("THR:"):
+            elif raw.startswith("THR:") or raw.startswith("MAX:"):
                 try:
-                    self._thr = int(raw[4:])
+                    val = int(raw[4:])
                 except ValueError:
-                    pass
+                    continue
+                if raw.startswith("MAX:"):
+                    self._max = max(0, min(100, val))
+                else:
+                    self._thr = max(-self._max, min(self._max, val))
 
     def _push(self, line):
         with self._lock:
@@ -76,6 +84,7 @@ class FakeRov:
             self._last_sensor = time.time()
             self._push("SENSOR:1:%.1f" % random.uniform(10, 60))
             self._push("MOTOR:%d" % self._thr)
+            self._push("LIMIT:%d" % self._max)
         with self._lock:
             return self._lines.popleft() if self._lines else b""
 
@@ -194,7 +203,7 @@ class Xbox:
             return 0
         self.pg.event.pump()
         v = -self.js.get_axis(self.AXIS_LEFT_Y)                      # flip so up is positive
-        if v < self.DEADZONE:                                        # forward only: stick down or neutral = 0
+        if abs(v) < self.DEADZONE:                                   # neutral = 0
             return 0
         v = (abs(v) - self.DEADZONE) / (1 - self.DEADZONE) * (1 if v > 0 else -1)
         return int(round(max(-1.0, min(1.0, v)) * 100))
@@ -206,6 +215,9 @@ class State:
         self.motor_enabled = False
         self.throttle = 0
         self.motor_applied = None
+        self.limit = None
+        self.entering = False
+        self.entry = ""
         self.lock = threading.Lock()
         self.tx = collections.deque(maxlen=8)
         self.rx = collections.deque(maxlen=8)
@@ -242,6 +254,10 @@ def reader(link, state):
                 state.sensor_id = parts[1] if len(parts) > 1 else "?"
                 state.sensor_cm = parts[2] if len(parts) > 2 else "--"
                 state.last_rx_time = time.time()
+        elif line.startswith("LIMIT:"):
+            with state.lock:
+                state.limit = line[6:]
+                state.last_rx_time = time.time()
         elif line.startswith("MOTOR:"):
             with state.lock:
                 state.motor_applied = line[6:]
@@ -269,6 +285,7 @@ def draw(stdscr, state, port_name, xbox):
         sid, cm = state.sensor_id, state.sensor_cm
         tx, rx = list(state.tx), list(state.rx)
         enabled, thr, applied = state.motor_enabled, state.throttle, state.motor_applied
+        limit, entering, entry = state.limit, state.entering, state.entry
 
     if age is None:
         status, attr = "WAITING FOR ROV...", curses.A_DIM
@@ -284,10 +301,14 @@ def draw(stdscr, state, port_name, xbox):
 
     ctl = "controller: %s" % xbox.name if xbox.available() else "controller: NONE (%s)" % xbox.name
     stdscr.addstr(3, 0, ctl[: w - 1], curses.A_DIM)
-    bar = "#" * (thr // 10) + "-" * (10 - thr // 10)
-    mtxt = "MOTOR %s  stick [%s] %3d%%   ROV applying: %s%%" % (
-        "ENABLED " if enabled else "disabled", bar, thr, applied if applied is not None else "--")
+    n = min(10, abs(thr) // 10)
+    bar = "#" * n + "-" * (10 - n)
+    mtxt = "MOTOR %s %s [%s] %3d%%  limit: %s%%  ROV applying: %s%%" % (
+        "ENABLED " if enabled else "disabled", "REV" if thr < 0 else "FWD", bar, abs(thr),
+        limit if limit is not None else "--", applied if applied is not None else "--")
     stdscr.addstr(7, 0, mtxt[: w - 1], bold if enabled else curses.A_DIM)
+    if entering:
+        stdscr.addstr(min(h - 1, 19), 0, ("Set speed limit 0-100, Enter = send, Esc = cancel:  %s_" % entry)[: w - 1], bold)
 
     stdscr.addstr(8, 0, "SENT TO ROV (keyboard -> tether):", bold)
     for i, line in enumerate(tx[-4:]):
@@ -296,7 +317,7 @@ def draw(stdscr, state, port_name, xbox):
     for i, line in enumerate(rx[-4:]):
         stdscr.addstr(15 + i, 2, line[: w - 3])
 
-    stdscr.addstr(min(h - 1, 20), 0, "arrows = send command   p = ping   m = motor on/off   q = quit"[: w - 1], curses.A_DIM)
+    stdscr.addstr(min(h - 1, 20), 0, "arrows = send command   p = ping   m = motor on/off   l = set limit   q = quit"[: w - 1], curses.A_DIM)
     stdscr.refresh()
 
 
@@ -321,9 +342,32 @@ def run(stdscr, link, port_name, xbox):
                 with state.lock:
                     state.throttle = thr
                 link.write(("THR:%d\n" % thr).encode())
+            if state.entering:                       # typing the new speed limit
+                if ord("0") <= key <= ord("9") and len(state.entry) < 3:
+                    with state.lock:
+                        state.entry += chr(key)
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    with state.lock:
+                        state.entry = state.entry[:-1]
+                elif key in (10, 13, curses.KEY_ENTER):
+                    if state.entry:
+                        val = max(0, min(100, int(state.entry)))
+                        send(link, state, "MAX:%d" % val)
+                    with state.lock:
+                        state.entering = False
+                        state.entry = ""
+                elif key == 27:                      # Esc
+                    with state.lock:
+                        state.entering = False
+                        state.entry = ""
+                continue
             if key in (ord("q"), ord("Q")):
                 break
-            if key in KEYMAP:
+            if key in (ord("l"), ord("L")):
+                with state.lock:
+                    state.entering = True
+                    state.entry = ""
+            elif key in KEYMAP:
                 send(link, state, "CMD:" + KEYMAP[key])
             elif key in (ord("p"), ord("P")):
                 send(link, state, "PING")

@@ -1,0 +1,29 @@
+/*
+  ROV-side proof of concept  (Arduino UNO R4 WiFi - the board with the 12x8 LED matrix)
+
+  Wiring
+    Fathom-S ROV board  ->  Arduino
+      TX  -> pin 0 (RX)      <- Blue Robotics' Arduino guide wires these straight through
+      RX  -> pin 1 (TX)         (RX to RX, TX to TX). If nothing arrives, swap the two.
+      5V  -> 5V   (or the breadboard 5V rail)
+      GND -> GND  (grounds MUST be common)
+    HC-SR04 ultrasonic sensor
+      VCC -> 5V    Trig -> pin 9    Echo -> pin 10    GND -> GND
+
+  Messages (text, one per line, 115200 baud, on the hardware UART "Serial1" = pins 0/1)
+    from Pi:  CMD:U / CMD:D / CMD:L / CMD:R   -> show that letter on the LED matrix, reply ACK:<letter>
+              PING                            -> reply PONG
+              THR:<-100..100>                 -> motor throttle %, no reply (it arrives ~20 times a second)
+    to Pi:    SENSOR:1:<cm>   every 500 ms    (SENSOR:1:-- if the sensor sees nothing)
+              MOTOR:<pct>     every 500 ms    (throttle actually being applied)
+
+  ESC (motor test)
+    ESC signal wire -> pin 6      ESC ground wire -> GND (common ground)
+    ESC red wire: leave it OFF the Arduino unless you know it is a 5 V BEC and the Arduino isn't powered another way.
+    Power the ESC from its own battery/supply, never from the Arduino.
+    Safety: output is capped at MAX_PERCENT, and the motor stops if no THR line arrives for 500 ms.
+
+  Libraries: ArduinoGraphics + Arduino_LED_Matrix (both ship with the UNO R4 board package;
+  Tools > Manage Libraries > "ArduinoGraphics" if the compiler can't find it).
+
+  If your board is NOT an R4 WiFi (no LED matrix),

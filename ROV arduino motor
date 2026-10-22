@@ -13,7 +13,7 @@
   Messages (text, one per line, 115200 baud, on the hardware UART "Serial1" = pins 0/1)
     from Pi:  CMD:U / CMD:D / CMD:L / CMD:R   -> show that letter on the LED matrix, reply ACK:<letter>
               PING                            -> reply PONG
-              THR:<-100..100>                 -> motor throttle %, no reply (it arrives ~20 times a second)
+              THR:<0..100>                    -> motor throttle %, no reply (it arrives ~20 times a second)
     to Pi:    SENSOR:1:<cm>   every 500 ms    (SENSOR:1:-- if the sensor sees nothing)
               MOTOR:<pct>     every 500 ms    (throttle actually being applied)
 
@@ -22,6 +22,13 @@
     ESC red wire: leave it OFF the Arduino unless you know it is a 5 V BEC and the Arduino isn't powered another way.
     Power the ESC from its own battery/supply, never from the Arduino.
     Safety: output is capped at MAX_PERCENT, and the motor stops if no THR line arrives for 500 ms.
+
+  Joystick display (LED matrix, no extra parts)
+    Bar graph across the top 6 rows: columns fill left to right as the stick goes up (12 columns = 100 %).
+    The bar shows the stick position the Pi SENT; the motor itself is still capped at MAX_PERCENT.
+    Bottom row: one dot that creeps along as THR messages arrive. Dot moving = Arduino is receiving.
+    Dot frozen and bar blank = nothing received for 0.5 s (failsafe has stopped the motor).
+    The board's built-in LED (pin 13) also toggles on every 5th THR message.
 
   Libraries: ArduinoGraphics + Arduino_LED_Matrix (both ship with the UNO R4 board package;
   Tools > Manage Libraries > "ArduinoGraphics" if the compiler can't find it).
@@ -43,12 +50,17 @@ const unsigned long REPORT_MS = 500;
 const int  ESC_PIN        = 6;
 const bool BIDIRECTIONAL  = true;    // true: 1500 us = stop, can reverse (e.g. Blue Robotics Basic ESC)
                                      // false: 1000 us = stop, forward only
+const bool FORWARD_ONLY   = true;    // one-motor test: negative throttle is treated as 0
 const int  MAX_PERCENT    = 25;      // TEST LIMIT: raise only after the first tests go well
 const unsigned long FAILSAFE_MS = 500;   // no THR line for this long -> stop
 const unsigned long ARM_MS      = 3000;  // hold the stop signal at power-up so the ESC arms
 Servo esc;
 unsigned long lastThr = 0;
 int appliedPct = 0;
+int shownCols = -1;       // what is currently drawn on the matrix
+int shownBeat = -1;
+int beat = 0;             // counts THR messages
+bool stale = false;
 
 String line = "";
 unsigned long lastReport = 0;
@@ -76,13 +88,34 @@ float readDistanceCm() {
   return us * 0.0343 / 2.0;
 }
 
+// Bar graph: `cols` columns lit (0..12) in rows 0-5, plus one heartbeat dot in row 7.
+void showBar(int cols, int beatCol) {
+  if (cols == shownCols && beatCol == shownBeat) return;   // nothing changed, skip the redraw
+  shownCols = cols;
+  shownBeat = beatCol;
+  matrix.beginDraw();
+  matrix.clear();
+  matrix.stroke(0xFFFFFFFF);
+  for (int c = 0; c < cols; c++) matrix.line(c, 0, c, 5);
+  if (beatCol >= 0) matrix.point(beatCol, 7);
+  matrix.endDraw();
+}
+
 int stopMicros() { return BIDIRECTIONAL ? 1500 : 1000; }
 
 void applyThrottle(int pct) {
+  int requested = constrain(pct, 0, 100);                  // stick position as received, for the display
+  if (FORWARD_ONLY && pct < 0) pct = 0;
   pct = constrain(pct, -MAX_PERCENT, MAX_PERCENT);
   if (!BIDIRECTIONAL && pct < 0) pct = 0;
   appliedPct = pct;
   esc.writeMicroseconds(BIDIRECTIONAL ? 1500 + pct * 4 : 1000 + pct * 10);   // 1100..1900 or 1000..2000 us
+
+  // show what we just received
+  beat++;
+  stale = false;
+  digitalWrite(LED_BUILTIN, (beat / 5) % 2);              // built-in LED blinks while messages arrive
+  showBar((requested * 12 + 50) / 100, (beat / 5) % 12);  // 0..12 columns, dot creeps along the bottom row
 }
 
 void handleLine(const String &msg) {
@@ -102,6 +135,7 @@ void handleLine(const String &msg) {
 void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
   Serial1.begin(115200);               // to the Fathom-S ROV board
   matrix.begin();
   showChar('*');                       // boot indicator
@@ -128,6 +162,13 @@ void loop() {
   if (millis() - lastThr > FAILSAFE_MS) {
     esc.writeMicroseconds(stopMicros());
     appliedPct = 0;
+    if (!stale) {                      // blank the display once: bar gone, no dot
+      stale = true;
+      shownCols = -2;
+      matrix.beginDraw();
+      matrix.clear();
+      matrix.endDraw();
+    }
   }
 
   if (millis() - lastReport >= REPORT_MS) {

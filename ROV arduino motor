@@ -9,24 +9,30 @@
       GND -> GND  (grounds MUST be common)
     HC-SR04 ultrasonic sensor
       VCC -> 5V    Trig -> pin 9    Echo -> pin 10    GND -> GND
+    ESC (motor test)
+      ESC signal wire -> pin 6      ESC ground wire -> GND (common ground)
+      ESC red wire: leave it OFF the Arduino unless you know it is a 5 V BEC and the Arduino isn't powered another way.
+      Power the ESC from its own battery/supply, never from the Arduino.
 
   Messages (text, one per line, 115200 baud, on the hardware UART "Serial1" = pins 0/1)
     from Pi:  CMD:U / CMD:D / CMD:L / CMD:R   -> show that letter on the LED matrix, reply ACK:<letter>
               PING                            -> reply PONG
-              THR:<0..100>                    -> motor throttle %, no reply (it arrives ~20 times a second)
+              THR:<-100..100>                 -> motor throttle %: + forward, - reverse (sent ~20 times a second)
+              MAX:<0..100>                    -> set the speed limit (%); applies in both directions
     to Pi:    SENSOR:1:<cm>   every 500 ms    (SENSOR:1:-- if the sensor sees nothing)
-              MOTOR:<pct>     every 500 ms    (throttle actually being applied)
+              MOTOR:<pct>     every 500 ms    (throttle actually applied, signed)
+              LIMIT:<pct>     every 500 ms    (current speed limit)
 
-  ESC (motor test)
-    ESC signal wire -> pin 6      ESC ground wire -> GND (common ground)
-    ESC red wire: leave it OFF the Arduino unless you know it is a 5 V BEC and the Arduino isn't powered another way.
-    Power the ESC from its own battery/supply, never from the Arduino.
-    Safety: output is capped at MAX_PERCENT, and the motor stops if no THR line arrives for 500 ms.
+  Safety
+    The limit starts at DEFAULT_MAX_PERCENT every time the board powers up, and can never go above
+    HARD_MAX_PERCENT. The motor stops if no THR line arrives for 500 ms.
+    Reversing needs a reversible ESC (BIDIRECTIONAL = true). Let the motor slow down before flipping direction.
 
   Joystick display (LED matrix, no extra parts)
-    Bar graph across the top 6 rows: columns fill left to right as the stick goes up (12 columns = 100 %).
-    The bar shows the stick position the Pi SENT; the motor itself is still capped at MAX_PERCENT.
-    Bottom row: one dot that creeps along as THR messages arrive. Dot moving = Arduino is receiving.
+    Bar graph from the centre: forward grows to the right (6 columns = 100 %), reverse grows to the left.
+    The two centre dots in row 6 are always on, so you can see where zero is.
+    The bar shows the stick position the Pi SENT; the motor itself is held to the limit.
+    Bottom row: one dot that creeps along as THR messages arrive. Moving = Arduino is receiving.
     Dot frozen and bar blank = nothing received for 0.5 s (failsafe has stopped the motor).
     The board's built-in LED (pin 13) also toggles on every 5th THR message.
 
@@ -49,15 +55,16 @@ const unsigned long REPORT_MS = 500;
 // ---- ESC / motor test settings
 const int  ESC_PIN        = 6;
 const bool BIDIRECTIONAL  = true;    // true: 1500 us = stop, can reverse (e.g. Blue Robotics Basic ESC)
-                                     // false: 1000 us = stop, forward only
-const bool FORWARD_ONLY   = true;    // one-motor test: negative throttle is treated as 0
-const int  MAX_PERCENT    = 25;      // TEST LIMIT: raise only after the first tests go well
+                                     // false: 1000 us = stop, forward only (reverse requests become 0)
+const int  DEFAULT_MAX_PERCENT = 25; // speed limit after every power-up
+const int  HARD_MAX_PERCENT    = 100;// the limit can never be set above this, whatever the Pi sends
+int maxPercent = DEFAULT_MAX_PERCENT;
 const unsigned long FAILSAFE_MS = 500;   // no THR line for this long -> stop
 const unsigned long ARM_MS      = 3000;  // hold the stop signal at power-up so the ESC arms
 Servo esc;
 unsigned long lastThr = 0;
 int appliedPct = 0;
-int shownCols = -1;       // what is currently drawn on the matrix
+int shownReq = -999;      // what is currently drawn on the matrix
 int shownBeat = -1;
 int beat = 0;             // counts THR messages
 bool stale = false;
@@ -88,15 +95,22 @@ float readDistanceCm() {
   return us * 0.0343 / 2.0;
 }
 
-// Bar graph: `cols` columns lit (0..12) in rows 0-5, plus one heartbeat dot in row 7.
-void showBar(int cols, int beatCol) {
-  if (cols == shownCols && beatCol == shownBeat) return;   // nothing changed, skip the redraw
-  shownCols = cols;
+// Bar graph from the centre: forward grows right, reverse grows left (6 columns each side).
+// `req` is the requested throttle (-100..100). Row 6 has the two centre dots, row 7 the heartbeat dot.
+void showBar(int req, int beatCol) {
+  if (req == shownReq && beatCol == shownBeat) return;     // nothing changed, skip the redraw
+  shownReq = req;
   shownBeat = beatCol;
+  int n = (abs(req) * 6 + 50) / 100;                       // 0..6 columns
   matrix.beginDraw();
   matrix.clear();
   matrix.stroke(0xFFFFFFFF);
-  for (int c = 0; c < cols; c++) matrix.line(c, 0, c, 5);
+  matrix.point(5, 6);                                      // centre markers
+  matrix.point(6, 6);
+  for (int i = 0; i < n; i++) {
+    int c = (req >= 0) ? 6 + i : 5 - i;
+    matrix.line(c, 0, c, 5);
+  }
   if (beatCol >= 0) matrix.point(beatCol, 7);
   matrix.endDraw();
 }
@@ -104,18 +118,17 @@ void showBar(int cols, int beatCol) {
 int stopMicros() { return BIDIRECTIONAL ? 1500 : 1000; }
 
 void applyThrottle(int pct) {
-  int requested = constrain(pct, 0, 100);                  // stick position as received, for the display
-  if (FORWARD_ONLY && pct < 0) pct = 0;
-  pct = constrain(pct, -MAX_PERCENT, MAX_PERCENT);
-  if (!BIDIRECTIONAL && pct < 0) pct = 0;
-  appliedPct = pct;
-  esc.writeMicroseconds(BIDIRECTIONAL ? 1500 + pct * 4 : 1000 + pct * 10);   // 1100..1900 or 1000..2000 us
+  int requested = constrain(pct, -100, 100);               // stick position as received, for the display
+  int applied = constrain(requested, -maxPercent, maxPercent);
+  if (!BIDIRECTIONAL && applied < 0) applied = 0;
+  appliedPct = applied;
+  esc.writeMicroseconds(BIDIRECTIONAL ? 1500 + applied * 4 : 1000 + applied * 10);   // 1100..1900 or 1000..2000 us
 
   // show what we just received
   beat++;
   stale = false;
   digitalWrite(LED_BUILTIN, (beat / 5) % 2);              // built-in LED blinks while messages arrive
-  showBar((requested * 12 + 50) / 100, (beat / 5) % 12);  // 0..12 columns, dot creeps along the bottom row
+  showBar(requested, (beat / 5) % 12);                    // dot creeps along the bottom row
 }
 
 void handleLine(const String &msg) {
@@ -126,6 +139,8 @@ void handleLine(const String &msg) {
     Serial1.println(c);                // proof the reply can come back up it
   } else if (msg == "PING") {
     Serial1.println("PONG");
+  } else if (msg.startsWith("MAX:")) {
+    maxPercent = constrain(msg.substring(4).toInt(), 0, HARD_MAX_PERCENT);
   } else if (msg.startsWith("THR:")) {
     applyThrottle(msg.substring(4).toInt());
     lastThr = millis();
@@ -164,7 +179,7 @@ void loop() {
     appliedPct = 0;
     if (!stale) {                      // blank the display once: bar gone, no dot
       stale = true;
-      shownCols = -2;
+      shownReq = -998;
       matrix.beginDraw();
       matrix.clear();
       matrix.endDraw();
@@ -181,5 +196,7 @@ void loop() {
     else Serial1.println(cm, 1);
     Serial1.print("MOTOR:");
     Serial1.println(appliedPct);
+    Serial1.print("LIMIT:");
+    Serial1.println(maxPercent);
   }
 }
